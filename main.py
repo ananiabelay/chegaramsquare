@@ -1,37 +1,71 @@
 import os
 import telebot
 import time
+import sqlite3
+import json
 from telebot import types
 
 # ================= CONFIG =================
+# Replace these with your actual values
 TOKEN = os.environ.get('TOKEN')
 ADMIN_ID = int(os.environ.get('ADMIN_ID', 0))
 CHANNEL = "@chegaramsquare"
 
-# --- NEW FEATURES ---
-PAYMENT_REQUIRED = False  # Toggle this to False to disable payment
+PAYMENT_REQUIRED = False
 PAYMENT_ACCOUNT = "1000668647751"
 PAYMENT_AMOUNT = "10 Birr"
-MAX_POSTS_PER_DAY = 20 
+MAX_POSTS_PER_DAY = 20
 
 bot = telebot.TeleBot(TOKEN)
 
-# ================= STORAGE =================
-user_data = {}
-pending_approvals = {}
-spam_tracker = {}
+# ================= DATABASE STORAGE =================
+# This ensures 10k users won't crash the bot or lose data on restart
+conn = sqlite3.connect("bot.db", check_same_thread=False)
+cursor = conn.cursor()
+
+cursor.execute("CREATE TABLE IF NOT EXISTS user_storage(user_id INTEGER PRIMARY KEY, data TEXT)")
+cursor.execute("CREATE TABLE IF NOT EXISTS pending_posts(post_id TEXT PRIMARY KEY, data TEXT)")
+cursor.execute("CREATE TABLE IF NOT EXISTS spam_storage(user_id INTEGER, timestamp REAL)")
+conn.commit()
+
+# ================= STORAGE HELPERS =================
+def save_user_data(uid, data):
+    cursor.execute("REPLACE INTO user_storage VALUES (?,?)", (uid, json.dumps(data)))
+    conn.commit()
+
+def load_user_data(uid):
+    cursor.execute("SELECT data FROM user_storage WHERE user_id=?", (uid,))
+    row = cursor.fetchone()
+    return json.loads(row[0]) if row else {}
+
+def save_pending_post(post_id, data):
+    cursor.execute("REPLACE INTO pending_posts VALUES (?,?)", (post_id, json.dumps(data)))
+    conn.commit()
+
+def load_pending_post(post_id):
+    cursor.execute("SELECT data FROM pending_posts WHERE post_id=?", (post_id,))
+    row = cursor.fetchone()
+    return json.loads(row[0]) if row else None
+
+def add_spam_record(uid):
+    cursor.execute("INSERT INTO spam_storage VALUES (?,?)", (uid, time.time()))
+    conn.commit()
+
+def get_spam_records(uid):
+    now = time.time()
+    cursor.execute("SELECT timestamp FROM spam_storage WHERE user_id=?", (uid,))
+    rows = cursor.fetchall()
+    valid = [r[0] for r in rows if now - r[0] < 86400]
+    cursor.execute("DELETE FROM spam_storage WHERE user_id=?", (uid,))
+    for t in valid:
+        cursor.execute("INSERT INTO spam_storage VALUES (?,?)", (uid, t))
+    conn.commit()
+    return valid
 
 # ================= HELPERS =================
-
 def is_spaming(user_id):
-    now = time.time()
-    if user_id not in spam_tracker:
-        spam_tracker[user_id] = []
-
-    # Filter only posts from the last 24 hours
-    spam_tracker[user_id] = [t for t in spam_tracker[user_id] if now - t < 86400]
-
-    return len(spam_tracker[user_id]) >= MAX_POSTS_PER_DAY
+    records = get_spam_records(user_id)
+    return len(records) >= MAX_POSTS_PER_DAY
 
 def format_phone(phone_text):
     clean = ''.join(filter(str.isdigit, phone_text))
@@ -44,159 +78,174 @@ def format_phone(phone_text):
     return None
 
 # ================= START =================
-
 @bot.message_handler(commands=['start'])
 def start(message):
     uid = message.chat.id
-
     if is_spaming(uid):
-        bot.send_message(
-            uid,
-            f"<b>⚠️ Daily Limit Reached</b>\n\nYou have already reached your limit of <b>{MAX_POSTS_PER_DAY}</b> post(s) per 24 hours. Please try again later!",
-            parse_mode="HTML"
-        )
+        bot.send_message(uid, f"<b>⚠️ Daily Limit Reached</b>\n\nYou've hit your limit of <b>{MAX_POSTS_PER_DAY}</b> posts for today. Come back tomorrow!", parse_mode="HTML")
         return
 
-    user_data[uid] = {}
-
+    save_user_data(uid, {})
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
-    markup.add("🏢 Service", "📦 Goods", "💼 Jobs")
+    markup.add("🏢 Service", "📦 Items", "💼 Jobs")
 
     bot.send_message(
         uid,
-        f"""
+        """
 🌟 <b>Welcome to HU Chegaram Square</b> 🌟
 
-Ready to reach thousands of students? 
-Select a category below to start your post!
-
-━━━━━━━━━━━━━━━━━━
-✅ <b>Services</b> | ✅ <b>Goods</b> | ✅ <b>Jobs</b>
-━━━━━━━━━━━━━━━━━━
+Ready to reach the entire campus? 🚀
+Select a category below to create your post:
 """,
         parse_mode="HTML",
         reply_markup=markup
     )
 
 # ================= TYPE SELECTION =================
-
-@bot.message_handler(func=lambda m: m.text in ["🏢 Service", "📦 Goods", "💼 Jobs"])
+@bot.message_handler(func=lambda m: m.text in ["🏢 Service", "📦 Items", "💼 Jobs"])
 def choose_type(message):
     uid = message.chat.id
-    clean_text = message.text.split(" ")[1] # Get text without emoji
-    user_data[uid] = {"type": clean_text.lower()}
+    
+    # FIXED: Manual check to prevent split() index errors on single-word buttons like "Jobs"
+    if "Items" in message.text:
+        clean_text = "Goods"
+    elif "Service" in message.text:
+        clean_text = "Service"
+    else:
+        clean_text = "Jobs"
+    
+    data = load_user_data(uid)
+    data["type"] = clean_text.lower()
+    save_user_data(uid, data)
 
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-
     if clean_text == "Service":
-        markup.add("Assignment", "Delivery", "Tutoring", "Other")
+        markup.add("Doing Assignment(አሳይመንት መስራት)", "Delivery(መላላክ)", "Tutoring(ማስጠናት)", "Guitar Teaching(ጊታር ማስተማር)", "Other(ሌላ)")
     elif clean_text == "Goods":
         markup2 = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-        markup2.add("💰 Sell", "🔍 Wanted To Buy")
-        bot.send_message(uid, "🏷 <b>Listing Type:</b>\nAre you selling or looking to buy?", parse_mode="HTML", reply_markup=markup2)
+        markup2.add("💰 Selling(ለመሸጥ)", "🔍 Looking to Buy(ለመግዛት)")
+        bot.send_message(uid, "✨ <b>What is your goal?</b>", parse_mode="HTML", reply_markup=markup2)
         bot.register_next_step_handler(message, set_goods_mode)
         return
     else:
         markup.add("Campus Work", "Coding", "Other")
 
-    bot.send_message(uid, "✨ <b>Choose Sub-Category:</b>", parse_mode="HTML", reply_markup=markup)
+    bot.send_message(uid, "📂 <b>Select a sub-category:</b>", parse_mode="HTML", reply_markup=markup)
     bot.register_next_step_handler(message, get_category)
 
 def set_goods_mode(message):
     uid = message.chat.id
-    user_data[uid]["goods_mode"] = "Wanted To Buy" if "Wanted" in message.text else "Sell"
+    data = load_user_data(uid)
+    data["goods_mode"] = "Wanted To Buy" if "Buy" in message.text else "Sell"
+    save_user_data(uid, data)
 
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add("Clothes", "Electronics", "Stationery", "Other")
-    bot.send_message(uid, "✨ <b>Select Category:</b>", parse_mode="HTML", reply_markup=markup)
+    markup.add("Clothes", "Electronics", "Plumpynut","Sandwitch", "Other" )
+    bot.send_message(uid, "📦 <b>What kind of item is it?</b>", parse_mode="HTML", reply_markup=markup)
     bot.register_next_step_handler(message, get_category)
 
 def get_category(message):
     uid = message.chat.id
-    user_data[uid]["category"] = message.text
-    bot.send_message(uid, "✏️ <b>Enter Title</b>\n(Max 60 chars, e.g., 'MacBook Pro 2020')", parse_mode="HTML", reply_markup=types.ReplyKeyboardRemove())
+    data = load_user_data(uid)
+    data["category"] = message.text
+    save_user_data(uid, data)
+
+    bot.send_message(
+        uid,
+        "📝 <b>Give your post a Title</b>\nKeep it short and catchy (Max 60 characters).",
+        parse_mode="HTML",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
     bot.register_next_step_handler(message, get_title)
 
 # ================= DETAILS =================
-
 def get_title(message):
     if len(message.text) > 60:
-        bot.send_message(message.chat.id, "❌ <b>Title too long!</b> Please try a shorter title:", parse_mode="HTML")
+        bot.send_message(message.chat.id, f"❌ <b>Too long!</b> Your title is {len(message.text)} characters. Please keep it under 60:", parse_mode="HTML")
         bot.register_next_step_handler(message, get_title)
         return
-    user_data[message.chat.id]["title"] = message.text
-    bot.send_message(message.chat.id, "💰 <b>Enter Price</b> (Numbers only):", parse_mode="HTML")
+
+    data = load_user_data(message.chat.id)
+    data["title"] = message.text
+    save_user_data(message.chat.id, data)
+
+    bot.send_message(message.chat.id, "💰 <b>Set your Price:</b>\n(Numbers only, e.g., 500)", parse_mode="HTML")
     bot.register_next_step_handler(message, get_price)
 
 def get_price(message):
     if not message.text.isdigit():
-        bot.send_message(message.chat.id, "❌ <b>Invalid Input!</b> Please send digits only (e.g. 500):", parse_mode="HTML")
+        bot.send_message(message.chat.id, "❌ <b>Invalid format!</b> Please enter numbers only:", parse_mode="HTML")
         bot.register_next_step_handler(message, get_price)
         return
-    user_data[message.chat.id]["temp_price"] = message.text
+
+    data = load_user_data(message.chat.id)
+    data["temp_price"] = message.text
+    save_user_data(message.chat.id, data)
+
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add("Fixed Price", "Per Hour (/hr)")
-    bot.send_message(message.chat.id, "📊 <b>Price Type:</b>", parse_mode="HTML", reply_markup=markup)
+    markup.add("Total Price", "Per Hour (/hr)")
+    bot.send_message(message.chat.id, "📊 <b>How is this priced?</b>", reply_markup=markup, parse_mode="HTML")
     bot.register_next_step_handler(message, set_price_type)
 
 def set_price_type(message):
     uid = message.chat.id
-    suffix = "/hr" if "/hr" in message.text else ""
-    user_data[uid]["price"] = f"{user_data[uid]['temp_price']} Birr{suffix}"
-    bot.send_message(uid, "📍 <b>Enter Location:</b>\n(e.g., Main Campus, Dorm 412)", parse_mode="HTML", reply_markup=types.ReplyKeyboardRemove())
+    data = load_user_data(uid)
+    suffix = " /hr" if "/hr" in message.text else ""
+    data["price"] = f"{data['temp_price']} Birr{suffix}"
+    save_user_data(uid, data)
+
+    bot.send_message(uid, "📍 <b>Where can you be found?</b>\n(e.g., Main Campus, Tecno , አግሪ ካምፓስ)", parse_mode="HTML", reply_markup=types.ReplyKeyboardRemove())
     bot.register_next_step_handler(message, get_location)
 
 def get_location(message):
-    user_data[message.chat.id]["location"] = message.text
-    bot.send_message(message.chat.id, "📞 <b>Enter Phone Number:</b>\n(09... or 07...)", parse_mode="HTML")
+    data = load_user_data(message.chat.id)
+    data["location"] = message.text
+    save_user_data(message.chat.id, data)
+    bot.send_message(message.chat.id, "📞 <b>Your Phone Number:</b>\n(09... or 07...)", parse_mode="HTML")
     bot.register_next_step_handler(message, get_phone)
 
 def get_phone(message):
     uid = message.chat.id
     phone = format_phone(message.text)
     if not phone:
-        bot.send_message(uid, "❌ <b>Invalid Phone!</b> Please check the number and try again:", parse_mode="HTML")
+        bot.send_message(uid, "❌ <b>Invalid Number!</b> Please try again:", parse_mode="HTML")
         bot.register_next_step_handler(message, get_phone)
         return
-    user_data[uid]["phone"] = phone
-    user_data[uid]["username"] = f"@{message.from_user.username}" if message.from_user.username else "No Username"
-    bot.send_message(uid, "📝 <b>Enter Description:</b>\nProvide details about your post.", parse_mode="HTML")
+
+    data = load_user_data(uid)
+    data["phone"] = phone
+    data["username"] = f"@{message.from_user.username}" if message.from_user.username else "No Username"
+    save_user_data(uid, data)
+
+    bot.send_message(uid, "📖 <b>Add a Description:</b>\nDescribe your item or service in detail.", parse_mode="HTML")
     bot.register_next_step_handler(message, get_description)
 
 def get_description(message):
     uid = message.chat.id
-    user_data[uid]["description"] = message.text
-    if user_data[uid]["type"] == "goods":
-        bot.send_message(uid, "📸 <b>Send One Photo of the item:</b>", parse_mode="HTML")
+    data = load_user_data(uid)
+    data["description"] = message.text
+    save_user_data(uid, data)
+
+    if data["type"] == "goods":
+        bot.send_message(uid, "📸 <b>Almost done!</b> Send one clear photo of your item:", parse_mode="HTML")
         bot.register_next_step_handler(message, get_photo)
     else:
         handle_payment_flow(uid)
 
 def get_photo(message):
     if message.photo:
-        user_data[message.chat.id]["photo"] = message.photo[-1].file_id
+        data = load_user_data(message.chat.id)
+        data["photo"] = message.photo[-1].file_id
+        save_user_data(message.chat.id, data)
         handle_payment_flow(message.chat.id)
     else:
-        bot.send_message(message.chat.id, "⚠️ Please upload an actual <b>photo</b>:", parse_mode="HTML")
+        bot.send_message(message.chat.id, "⚠️ <b>Please send an image file:</b>", parse_mode="HTML")
         bot.register_next_step_handler(message, get_photo)
 
-# ================= PAYMENT LOGIC =================
-
+# ================= PAYMENT =================
 def handle_payment_flow(uid):
     if PAYMENT_REQUIRED:
-        bot.send_message(
-            uid,
-            f"""
-💳 <b>Payment Required</b>
-
-To post, please pay <b>{PAYMENT_AMOUNT}</b>.
-Bank: <b>CBE (Commercial Bank)</b>
-Account: <code>{PAYMENT_ACCOUNT}</code>
-
-After paying, <b>send the Transaction Link</b> (CBE Birr link) below to proceed:
-""",
-            parse_mode="HTML"
-        )
+        bot.send_message(uid, f"💳 <b>Payment Required</b>\n\nPay {PAYMENT_AMOUNT}\nAccount: <code>{PAYMENT_ACCOUNT}</code>\n\nSend the transaction link here after paying. \n Ex: https://cbe.com", parse_mode="HTML")
         bot.register_next_step_handler_by_chat_id(uid, get_payment_link)
     else:
         preview_post(uid)
@@ -204,15 +253,15 @@ After paying, <b>send the Transaction Link</b> (CBE Birr link) below to proceed:
 def get_payment_link(message):
     uid = message.chat.id
     if "http" not in message.text:
-        bot.send_message(uid, "❌ <b>Invalid Link!</b> Please send the full CBE transaction link:", parse_mode="HTML")
+        bot.send_message(uid, "❌ <b>Link invalid!</b> Paste the full transaction link:", parse_mode="HTML")
         bot.register_next_step_handler(message, get_payment_link)
         return
-
-    user_data[uid]["payment_link"] = message.text
+    data = load_user_data(uid)
+    data["payment_link"] = message.text
+    save_user_data(uid, data)
     preview_post(uid)
 
-# ================= PREVIEW & SUBMIT =================
-
+# ================= PREVIEW =================
 def build_post_text(data):
     if data["type"] == "goods":
         header = "─── 🔎 WANTED TO BUY ───" if data.get("goods_mode") == "Wanted To Buy" else "─── 🏷️ FOR SALE ───"
@@ -221,42 +270,22 @@ def build_post_text(data):
     else:
         header = "─── 💼 JOB OPPORTUNITY ───"
 
-    pay_info = f"\n🔗 <b>Payment:</b> {data['payment_link']}" if "payment_link" in data else ""
-
-    return f"""
-<b>{header}</b>
-
-<b>{data['title']}</b>
-
-💰 <b>Price:</b> {data['price']}
-
-📍 <b>Location:</b> {data['location']}
-
-👤 <b>Contact:</b> {data['username']}
-
-📞 <b>Phone:</b> {data['phone']}
-
-📝 <b>Description:</b>
-{data['description']}
-{pay_info}
-
-<b>🚀 Post your own for FREE:</b>
- 👉 @chegarams_bot
-
-#{data['type']} #{data['category'].replace(' ', '')}
-"""
+    pay_info = f"\n🔗 Payment: {data['payment_link']}" if "payment_link" in data else ""
+    return f"<b>{header}</b>\n\n<b>{data['title']}</b>\n\n💰 Price: {data['price']}\n\n 📍 Location: {data['location']}\n\n👤 Contact: {data['username']} | 📞 Phone: {data['phone']}\n \n 📝 Description:\n \n {data['description']}\n{pay_info}\n\n<b>🚀 Post your own for FREE:</b>\n 👉 @chegarams_bot\n\n#{data['type']} #{data['category'].replace(' ', '')}"
 
 def preview_post(uid):
-    data = user_data[uid]
+    data = load_user_data(uid)
     text = build_post_text(data)
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add("✅ Submit for Review", "🔁 Start Again")
 
+    bot.send_message(uid, "👀 <b>Here is a preview of your post:</b>", parse_mode="HTML")
     if "photo" in data:
-        bot.send_photo(uid, data["photo"], caption="<b>Post Preview:</b>\n" + text, parse_mode="HTML", reply_markup=markup)
+        bot.send_photo(uid, data["photo"], caption=text, parse_mode="HTML", reply_markup=markup)
     else:
-        bot.send_message(uid, "<b>Post Preview:</b>\n" + text, parse_mode="HTML", reply_markup=markup)
+        bot.send_message(uid, text, parse_mode="HTML", reply_markup=markup)
 
+# ================= FINAL SUBMIT =================
 @bot.message_handler(func=lambda m: m.text in ["✅ Submit for Review", "🔁 Start Again"])
 def handle_final(message):
     uid = message.chat.id
@@ -264,45 +293,64 @@ def handle_final(message):
         start(message)
         return
 
-    # Success - Mark spam tracker ONLY on submission
-    spam_tracker[uid].append(time.time())
-
+    add_spam_record(uid)
     post_id = str(int(time.time()))
-    pending_approvals[post_id] = user_data[uid]
-    data = user_data[uid]
-    text = build_post_text(data)
+    data = load_user_data(uid)
+    data["user_id"] = uid  # Ensure we can notify user on approval/decline
+    save_pending_post(post_id, data)
 
+    text = build_post_text(data)
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton("✅ Approve", callback_data=f"app_{post_id}"),
         types.InlineKeyboardButton("❌ Decline", callback_data=f"dec_{post_id}")
     )
 
+    # FIXED: Admin preview now correctly handles images
     if "photo" in data:
-        bot.send_photo(ADMIN_ID, data["photo"], caption="<b>NEW REQUEST</b>\n" + text, parse_mode="HTML", reply_markup=markup)
+        bot.send_photo(ADMIN_ID, data["photo"], caption="🆕 <b>INCOMING POST REQUEST</b>\n"+text,
+                       parse_mode="HTML", reply_markup=markup)
     else:
-        bot.send_message(ADMIN_ID, "<b>NEW REQUEST</b>\n" + text, parse_mode="HTML", reply_markup=markup)
+        bot.send_message(ADMIN_ID, "🆕 <b>INCOMING POST REQUEST</b>\n"+text,
+                         parse_mode="HTML", reply_markup=markup)
 
-    bot.send_message(uid, "🚀 <b>Success!</b> Your post has been sent to the Admin for review. You will see it in the channel once approved.", parse_mode="HTML", reply_markup=types.ReplyKeyboardRemove())
+    bot.send_message(uid, "🚀 <b>Success!</b> Your post is now with the admin team for review. Check the channel soon!", parse_mode="HTML", reply_markup=types.ReplyKeyboardRemove())
 
 # ================= ADMIN CALLBACK =================
-
 @bot.callback_query_handler(func=lambda call: True)
 def admin_callback(call):
     action, post_id = call.data.split("_")
-    if action == "app":
-        data = pending_approvals.get(post_id)
-        if data:
-            # Clean payment link from final post
-            data.pop('payment_link', None) 
-            text = build_post_text(data)
-            if "photo" in data:
-                bot.send_photo(CHANNEL, data["photo"], caption=text, parse_mode="HTML")
-            else:
-                bot.send_message(CHANNEL, text, parse_mode="HTML")
-            del pending_approvals[post_id]
+    data = load_pending_post(post_id)
 
+    if not data:
+        bot.answer_callback_query(call.id, "Error: Data expired.")
+        return
+
+    user_id = data.get("user_id")
+
+    if action == "app":
+        data.pop("payment_link", None)
+        text = build_post_text(data)
+        if "photo" in data:
+            bot.send_photo(CHANNEL, data["photo"], caption=text, parse_mode="HTML")
+        else:
+            bot.send_message(CHANNEL, text, parse_mode="HTML")
+        
+        # Notify the user
+        try:
+            bot.send_message(user_id, "🎉 <b>Good news!</b> Your post has been approved and is now live on @chegaramsquare!")
+        except:
+            pass
+
+    elif action == "dec":
+        # Notify the user
+        try:
+            bot.send_message(user_id, "❌ <b>Post Declined.</b> Your submission didn't meet our guidelines. Feel free to try again with updated info!")
+        except:
+            pass
+    
     bot.answer_callback_query(call.id, "Action Completed")
     bot.delete_message(call.message.chat.id, call.message.message_id)
 
+# ================= RUN =================
 bot.polling(none_stop=True)
