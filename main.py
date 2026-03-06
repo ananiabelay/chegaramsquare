@@ -19,47 +19,67 @@ MAX_POSTS_PER_DAY = 20
 bot = telebot.TeleBot(TOKEN)
 
 # ================= DATABASE STORAGE =================
-# This ensures 10k users won't crash the bot or lose data on restart
-conn = sqlite3.connect("bot.db", check_same_thread=False)
-cursor = conn.cursor()
+DB_PATH = "bot.db"
 
+def get_db():
+    # Fresh connection for every request to avoid "Recursive use" errors in multi-threading
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    return conn, conn.cursor()
+
+# Initial setup to ensure tables exist
+conn, cursor = get_db()
 cursor.execute("CREATE TABLE IF NOT EXISTS user_storage(user_id INTEGER PRIMARY KEY, data TEXT)")
 cursor.execute("CREATE TABLE IF NOT EXISTS pending_posts(post_id TEXT PRIMARY KEY, data TEXT)")
 cursor.execute("CREATE TABLE IF NOT EXISTS spam_storage(user_id INTEGER, timestamp REAL)")
 conn.commit()
+conn.close()
 
 # ================= STORAGE HELPERS =================
 def save_user_data(uid, data):
+    conn, cursor = get_db()
     cursor.execute("REPLACE INTO user_storage VALUES (?,?)", (uid, json.dumps(data)))
     conn.commit()
+    conn.close()
 
 def load_user_data(uid):
+    conn, cursor = get_db()
     cursor.execute("SELECT data FROM user_storage WHERE user_id=?", (uid,))
     row = cursor.fetchone()
+    conn.close()
     return json.loads(row[0]) if row else {}
 
 def save_pending_post(post_id, data):
+    conn, cursor = get_db()
     cursor.execute("REPLACE INTO pending_posts VALUES (?,?)", (post_id, json.dumps(data)))
     conn.commit()
+    conn.close()
 
 def load_pending_post(post_id):
+    conn, cursor = get_db()
     cursor.execute("SELECT data FROM pending_posts WHERE post_id=?", (post_id,))
     row = cursor.fetchone()
+    conn.close()
     return json.loads(row[0]) if row else None
 
 def add_spam_record(uid):
+    conn, cursor = get_db()
     cursor.execute("INSERT INTO spam_storage VALUES (?,?)", (uid, time.time()))
     conn.commit()
+    conn.close()
 
 def get_spam_records(uid):
     now = time.time()
+    conn, cursor = get_db()
     cursor.execute("SELECT timestamp FROM spam_storage WHERE user_id=?", (uid,))
     rows = cursor.fetchall()
     valid = [r[0] for r in rows if now - r[0] < 86400]
+    
     cursor.execute("DELETE FROM spam_storage WHERE user_id=?", (uid,))
     for t in valid:
         cursor.execute("INSERT INTO spam_storage VALUES (?,?)", (uid, t))
+    
     conn.commit()
+    conn.close()
     return valid
 
 # ================= HELPERS =================
@@ -106,7 +126,6 @@ Select a category below to create your post:
 def choose_type(message):
     uid = message.chat.id
     
-    # FIXED: Manual check to prevent split() index errors on single-word buttons like "Jobs"
     if "Items" in message.text:
         clean_text = "Goods"
     elif "Service" in message.text:
@@ -306,7 +325,6 @@ def handle_final(message):
         types.InlineKeyboardButton("❌ Decline", callback_data=f"dec_{post_id}")
     )
 
-    # FIXED: Admin preview now correctly handles images
     if "photo" in data:
         bot.send_photo(ADMIN_ID, data["photo"], caption="🆕 <b>INCOMING POST REQUEST</b>\n"+text,
                        parse_mode="HTML", reply_markup=markup)
@@ -336,14 +354,12 @@ def admin_callback(call):
         else:
             bot.send_message(CHANNEL, text, parse_mode="HTML")
         
-        # Notify the user
         try:
             bot.send_message(user_id, "🎉 <b>Good news!</b> Your post has been approved and is now live on @chegaramsquare!")
         except:
             pass
 
     elif action == "dec":
-        # Notify the user
         try:
             bot.send_message(user_id, "❌ <b>Post Declined.</b> Your submission didn't meet our guidelines. Feel free to try again with updated info!")
         except:
